@@ -2,8 +2,6 @@ import telebot
 from telebot import types
 import requests
 import os
-import time
-import re
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -13,152 +11,171 @@ if not BOT_TOKEN:
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
-CURRENCIES = {
-    "USD": "Доллар США",
-    "EUR": "Евро",
-    "GBP": "Фунт стерлингов",
-    "CNY": "Юань",
-    "JPY": "Иена",
-    "AED": "Дирхам ОАЭ",
-}
+API_URL = "https://www.cbr-xml-daily.ru/daily_json.js"
+POPULAR = ["USD", "EUR", "CNY"]
+CACHE = {"data": None, "time": 0}
+CACHE_SECONDS = 600  # 10 минут
 
-cache = {"data": None, "time": 0}
+
+# ---------- Получение курсов (с кешем) ----------
 
 def get_rates():
-    if cache["data"] is not None and time.time() - cache["time"] < 600:
-        return cache["data"]
+    """Возвращает словарь валют с ЦБ РФ. Держит данные 10 минут в памяти."""
+    import time
+    now = time.time()
+    if CACHE["data"] is not None and now - CACHE["time"] < CACHE_SECONDS:
+        return CACHE["data"]
     try:
-        r = requests.get("https://www.cbr-xml-daily.ru/daily_json.js", timeout=10)
+        r = requests.get(API_URL, timeout=10)
         r.raise_for_status()
-        data = r.json()
-        cache["data"] = data
-        cache["time"] = time.time()
+        data = r.json()["Valute"]
+        CACHE["data"] = data
+        CACHE["time"] = now
         return data
     except Exception:
-        return None
+        return CACHE["data"]  # если API упал — отдаём старые данные, они лучше ошибки
 
-def rate_text(code):
+
+def get_rate_info(code):
+    """Возвращает (текущий курс, вчерашний курс) или None."""
     data = get_rates()
-    if not data:
-        return "⚠️ Не удалось получить курсы. Попробуй позже."
-    val = data["Valute"].get(code)
-    if not val:
-        return f"Валюта {code} не найдена."
-    course = val["Value"] / val["Nominal"]
-    diff = val["Value"] - val["Previous"]
-    arrow = "📈 +" if diff > 0 else ("📉 " if diff < 0 else "➖ ")
-    change = f"{arrow}{abs(diff / val['Nominal']):.2f} ₽ за сутки"
-    date = data["Date"][:10]
-    return (
-        f"{val['Name']} ({code})\n"
-        f"Курс ЦБ РФ: **{course:.2f} ₽**\n"
-        f"{change}\n"
-        f"Данные на {date}"
-    )
+    if not data or code not in data:
+        return None
+    val = data[code]
+    rate = val["Value"] / val["Nominal"]
+    prev = val["Previous"] / val["Nominal"]
+    return rate, prev
 
-def main_menu():
+
+# ---------- Клавиатура ----------
+
+def rates_keyboard():
     kb = types.InlineKeyboardMarkup(row_width=3)
-    buttons = [types.InlineKeyboardButton(code, callback_data=f"rate:{code}") for code in CURRENCIES]
-    kb.add(*buttons)
+    kb.add(*[types.InlineKeyboardButton(f"💱 {code}", callback_data=f"rate_{code}") for code in POPULAR])
     return kb
+
+
+def format_change(code):
+    """Строка с динамикой курса: стрелка + изменение за сутки."""
+    info = get_rate_info(code)
+    if not info:
+        return ""
+    rate, prev = info
+    diff = rate - prev
+    arrow = "📈" if diff > 0 else ("📉" if diff < 0 else "➖")
+    if diff == 0:
+        return f"{arrow} Курс не изменился"
+    word = "вырос" if diff > 0 else "упал"
+    return f"{arrow} Курс {word} на {abs(diff):.2f} ₽ за сутки"
+
+
+# ---------- Команды ----------
 
 @bot.message_handler(commands=["start"])
 def start(message):
     bot.send_message(
         message.chat.id,
-        "Привет! Я бот курсов валют 💱\n\n"
-        "Нажми на кнопку ниже или напиши /help, чтобы узнать команды.",
-        reply_markup=main_menu(),
+        "Привет! Я валютный бот 💱\n\n"
+        "Напиши сумму и валюту, и я переведу в рубли.\n"
+        "Например: `100 USD` или `50,5 EUR`\n\n"
+        "Или выбери валюту кнопкой ниже 👇",
+        parse_mode="Markdown",
+        reply_markup=rates_keyboard(),
     )
+
 
 @bot.message_handler(commands=["help"])
-def help_command(message):
+def help_cmd(message):
     bot.send_message(
         message.chat.id,
-        "🤖 Я — бот курсов валют ЦБ РФ.\n\n"
-        "Что умею:\n"
-        "• /start — главное меню\n"
-        "• /rates — список курсов\n"
-        "• /rate USD — курс одной валюты\n"
-        "• 100 USD в RUB — конвертер\n\n"
-        "Все данные — официальные курсы ЦБ."
+        "🤖 Что я умею:\n\n"
+        "• `100 USD` — перевести сумму в рубли\n"
+        "• Кнопки ниже — быстрый курс\n"
+        "• Понимаю запятые: `99,9 EUR` тоже сработает\n\n"
+        "Данные — официальные курсы ЦБ РФ, обновление раз в 10 минут.",
+        parse_mode="Markdown",
+        reply_markup=rates_keyboard(),
     )
 
-@bot.message_handler(commands=["rates"])
-def rates(message):
-    data = get_rates()
-    if not data:
-        bot.send_message(message.chat.id, "⚠️ Не удалось получить курсы.")
+
+# ---------- Кнопки ----------
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("rate_"))
+def rate_callback(call):
+    code = call.data.replace("rate_", "")
+    info = get_rate_info(code)
+    if not info:
+        bot.answer_callback_query(call.id, f"Не удалось получить курс {code}")
         return
-    lines = ["📊 **Курсы ЦБ РФ:**\n"]
-    for code, name in CURRENCIES.items():
-        val = data["Valute"][code]
-        course = val["Value"] / val["Nominal"]
-        lines.append(f"{name} ({code}): {course:.2f} ₽")
-    bot.send_message(message.chat.id, "\n".join(lines), parse_mode="Markdown", reply_markup=main_menu())
 
-@bot.message_handler(commands=["rate"])
-def rate(message):
-    parts = message.text.split()
-    if len(parts) != 2:
-        bot.send_message(message.chat.id, "Напиши так: /rate USD")
-        return
-    code = parts[1].upper()
-    bot.send_message(message.chat.id, rate_text(code), parse_mode="Markdown")
-
-# НОВЫЙ УМНЫЙ КОНВЕРТЕР
-@bot.message_handler(func=lambda m: True)  # ловит ВСЕ сообщения
-def converter(message):
-    text = message.text
-    # Ищем паттерн: число (с точкой или запятой) + пробел + 3 буквы (валюта) + что угодно + 3 буквы (валюта)
-    # Пример: 100.5 USD в RUB, 100,5 USD RUB, 50 EUR to RUB
-    pattern = r'([\d]+(?:[.,]\d+)?)\s+([A-Z]{3})\s+.*?([A-Z]{3})'
-    match = re.search(pattern, text, re.IGNORECASE)
-
-    if match:
-        amount_str, from_code, to_code = match.groups()
-        from_code = from_code.upper()
-        to_code = to_code.upper()
-
-        # Заменяем запятую на точку для float
-        amount = float(amount_str.replace(',', '.'))
-
-        data = get_rates()
-        if not data:
-            bot.send_message(message.chat.id, "⚠️ Не удалось получить курсы. Попробуй позже.")
-            return
-
-        valutes = data["Valute"]
-
-        def to_rub(code):
-            if code == "RUB":
-                return 1.0
-            val = valutes.get(code)
-            if not val:
-                raise KeyError(f"Валюта {code} не найдена")
-            return val["Value"] / val["Nominal"]
-
-        try:
-            result = amount * to_rub(from_code) / to_rub(to_code)
-            bot.send_message(
-                message.chat.id,
-                f"💱 {amount:g} {from_code} = **{result:,.2f} {to_code}**\n"
-                f"(по курсу ЦБ РФ)",
-                parse_mode="Markdown"
-            )
-        except KeyError:
-            bot.send_message(message.chat.id, f"⚠️ Валюта не найдена: проверь коды ({from_code}, {to_code})")
-    else:
-        # Если сообщение не похоже на конвертер, не отвечаем на него автоматически.
-        # Но чтобы не спамить, мы просто ничего не делаем, если это не команда.
-        pass
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("rate:"))
-def callback_rate(call):
-    code = call.data.split(":")[1]
+    rate, prev = info
+    text = f"💵 {code}: {rate:.2f} ₽\n{format_change(code)}"
+    bot.edit_message_text(
+        text,
+        call.message.chat.id,
+        call.message.message_id,
+        reply_markup=rates_keyboard(),
+    )
     bot.answer_callback_query(call.id)
-    bot.send_message(call.message.chat.id, rate_text(code), parse_mode="Markdown")
+
+
+# ---------- Конвертер (весь остальной текст) ----------
+
+@bot.message_handler(func=lambda message: True)
+def handle_text(message):
+    text = message.text.strip().replace(",", ".")
+    parts = text.split()
+
+    if len(parts) < 2:
+        bot.reply_to(
+            message,
+            "Напиши сумму и валюту, например: `100 USD`\n"
+            "Или нажми кнопку ниже 👇",
+            parse_mode="Markdown",
+            reply_markup=rates_keyboard(),
+        )
+        return
+
+    amount_str, code = parts[0], parts[1].upper()
+
+    try:
+        amount = float(amount_str)
+    except ValueError:
+        bot.reply_to(
+            message,
+            f"«{amount_str}» не похоже на число 🙂 Попробуй так: `100 USD`",
+            parse_mode="Markdown",
+        )
+        return
+
+    if amount <= 0:
+        bot.reply_to(message, "Сумма должна быть больше нуля!")
+        return
+
+    info = get_rate_info(code)
+    if not info:
+        bot.reply_to(
+            message,
+            f"Не знаю валюту {code}. Попробуй USD, EUR, CNY, GBP или другой код валюты.",
+        )
+        return
+
+    rate, _ = info
+    result = amount * rate
+    bot.reply_to(
+        message,
+        f"💵 {amount:g} {code} = {result:,.2f} ₽".replace(",", " ").replace(".", ",") + "\n"
+        + format_change(code),
+        reply_markup=rates_keyboard(),
+    )
+
 
 if __name__ == "__main__":
     print("Бот запущен!")
-    bot.infinity_polling(skip_pending=True)
+    while True:
+        try:
+            bot.infinity_polling(skip_pending=True, timeout=30)
+        except Exception as e:
+            print(f"Ошибка соединения: {e}. Перезапуск через 15 секунд...")
+            import time
+            time.sleep(15)
